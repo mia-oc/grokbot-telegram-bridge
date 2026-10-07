@@ -27,6 +27,9 @@ const TYPING_INTERVAL_MS = 4_000;
 const TYPING_MAX_MS = 120_000;
 const WAKE_TIMEOUT_MS = 10_000;
 
+/** OpenClaw-style progress draft initial headline (streaming.mode=progress). */
+const PROGRESS_DRAFT_INITIAL = "● waking Grok Bot";
+
 function readTrimmedFileSync(p) {
   try {
     return fs.readFileSync(p, "utf8").trim();
@@ -118,37 +121,70 @@ async function sendChatAction(token, chatId, action = "typing") {
   }
 }
 
+/**
+ * sendMessage; returns message_id on success, null otherwise.
+ * Never logs token.
+ */
 async function sendTextMessage(token, chatId, text) {
-  if (!token || chatId == null || !text) return;
+  if (!token || chatId == null || !text) return null;
   try {
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    await fetch(url, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text }),
     });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && data.result && data.result.message_id != null) {
+      return data.result.message_id;
+    }
+    return null;
   } catch {
     // best-effort; never log token
+    return null;
   }
 }
 
-/** Immediate human-visible receipt so "typing" is not the only signal. */
-async function sendQueuedReceipt(chatId, created) {
-  if (!created) return;
+/**
+ * OpenClaw-style progress draft: ONE status message on new inbound.
+ * Persists { chat_id, progress_message_id } to spool/<update_id>.meta.json (0600).
+ * On idempotent redelivery (created===false), do not send another draft.
+ * Returns progress_message_id or null.
+ */
+async function startProgressDraft(chatId, updateId, created) {
+  if (!created) return null;
+  if (!chatAllowed(chatId)) return null;
   const token = loadBotToken();
-  if (!chatAllowed(chatId)) return;
-  await sendTextMessage(
-    token,
-    chatId,
-    "Queued for Grok Bot — waking the agent now. Typing alone is not progress; this receipt is.",
-  );
+  if (!token) return null;
+
+  const messageId = await sendTextMessage(token, chatId, PROGRESS_DRAFT_INITIAL);
+  if (messageId == null) {
+    console.error("listener: progress draft send failed");
+    return null;
+  }
+
+  const metaPath = path.join(SPOOL, `${updateId}.meta.json`);
+  const meta = {
+    chat_id: chatId,
+    progress_message_id: messageId,
+  };
+  try {
+    const tmp = path.join(SPOOL, `.${updateId}.meta.${process.pid}.${Date.now()}.tmp`);
+    await fsp.writeFile(tmp, JSON.stringify(meta) + "\n", { mode: 0o600 });
+    await fsp.rename(tmp, metaPath);
+  } catch (err) {
+    console.error(
+      `listener: progress meta write failed: ${err && err.message ? err.message : "unknown"}`,
+    );
+  }
+  return messageId;
 }
 
 /**
  * POST a wake to Grok Bot webhook-routine after a NEW spool write.
  * Never logs URL or secret. Failures are log-only; never affect Telegram 200.
  */
-async function wakeGrokBot({ updateId, chatId }) {
+async function wakeGrokBot({ updateId, chatId, progressMessageId }) {
   if (!chatAllowed(chatId)) return;
 
   const wakeUrl = readTrimmedFileSync(WAKE_URL_PATH);
@@ -172,11 +208,15 @@ async function wakeGrokBot({ updateId, chatId }) {
     headers["X-Webhook-Secret"] = wakeSecret;
   }
 
-  const body = JSON.stringify({
+  const payload = {
     source: "telegram-bridge",
     update_id: String(updateId),
     chat_id: chatId,
-  });
+  };
+  if (progressMessageId != null) {
+    payload.progress_message_id = progressMessageId;
+  }
+  const body = JSON.stringify(payload);
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), WAKE_TIMEOUT_MS);
@@ -207,6 +247,7 @@ async function wakeGrokBot({ updateId, chatId }) {
 
 /**
  * While spool file exists (and under 2 min), send typing every 4s.
+ * Optional/secondary: progress draft text is the primary signal of life.
  * Only for message updates; respects ALLOWED_CHAT_ID when present.
  */
 function startTypingKeepalive(spoolPath, chatId) {
@@ -316,12 +357,18 @@ const server = http.createServer(async (req, res) => {
 
       const msg = update.message || update.edited_message;
       const chatId = msg && msg.chat && msg.chat.id != null ? msg.chat.id : null;
+      let progressMessageId = null;
       if (chatId != null) {
-        void sendQueuedReceipt(chatId, created);
+        // Await draft so wake POST can include progress_message_id.
+        progressMessageId = await startProgressDraft(chatId, String(updateId), created);
         startTypingKeepalive(spoolPath, chatId);
       }
       if (created) {
-        void wakeGrokBot({ updateId, chatId });
+        void wakeGrokBot({
+          updateId,
+          chatId,
+          progressMessageId,
+        });
       }
       return;
     }

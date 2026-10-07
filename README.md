@@ -8,8 +8,9 @@ Open-source **Telegram ↔ Grok Bot** bridge: a local webhook listener, on-disk 
 
 - A small Node.js service that receives Telegram Bot API webhooks on `127.0.0.1:8787`
 - An atomic on-disk **spool** of inbound updates (`spool/<update_id>.json`)
-- A **stdio MCP** server exposing Telegram helpers (`tg_send_message`, `tg_list_spool`, …) that Grok Bot can call as a custom MCP
+- A **stdio MCP** server exposing Telegram helpers (`tg_send_message`, `tg_edit_message`, `tg_list_spool`, …) that Grok Bot can call as a custom MCP
 - Designed to **wake Grok Bot via a webhook routine** on each new Telegram message (NOT cron)
+- **OpenClaw-style progress drafts**: one editable status message while the agent works, then delete + final answer
 
 **Is not**
 
@@ -17,10 +18,36 @@ Open-source **Telegram ↔ Grok Bot** bridge: a local webhook listener, on-disk 
 - A hosted SaaS or always-on cloud bot framework
 - A cron-first design — **polling/cron drain was the wrong architecture**; use a webhook routine
 - A replacement for BotFather, Telegram clients, or Grok Bot itself
+- Full OpenClaw tool-stream UI (this bridge approximates `streaming.mode=progress` with edit/delete, not native Telegram streaming)
 
-Architecture in one line: **Telegram → HTTPS relay → local listener → spool → wake POST → Grok Bot webhook routine → MCP (`tg_list_spool` / `tg_send_message`)**.
+Architecture in one line: **Telegram → HTTPS relay → local listener → spool + progress draft → wake POST → Grok Bot webhook routine → MCP (`tg_progress` / `tg_delete_message` / `tg_send_message`)**.
 
-**UX note (be blunt):** Telegram “typing…” alone is *not* progress (OpenClaw can stream tool actions; this bridge cannot). The listener therefore sends an immediate **“Queued for Grok Bot…”** receipt when a new update is spooled, then keeps typing warm until the spool item is acknowledged. Typing ≠ the agent working. Cron ≠ immediacy. Wake the agent.
+## Progress drafts (OpenClaw `streaming.mode=progress`)
+
+OpenClaw’s Telegram channel can show a live **progress** message that is edited as the agent works, then cleared when the final answer lands. This bridge mirrors that UX:
+
+| Phase | What happens |
+|-------|----------------|
+| **Inbound** | Listener sends **one** status draft (e.g. `● waking Grok Bot`). Persists `{ chat_id, progress_message_id }` to `spool/<update_id>.meta.json` (mode `0600`). Idempotent redelivery does **not** send another draft. |
+| **Working** | Agent **edits that same message** via `tg_edit_message` / `tg_progress` with commentary / tool-ish status lines (rolling log under a headline). |
+| **Done** | Agent **deletes** the progress draft (`tg_delete_message`), then sends the **final answer as a new normal message** (`tg_send_message`). |
+| **Typing** | Optional/secondary keepalive only — **progress text is the signal of life**, not “typing…”. |
+
+A static “Queued…” receipt is **not** the design. Progress text that updates is.
+
+### Agent routine behaviour (recommended)
+
+When woken, the webhook routine should:
+
+1. Call `tg_list_spool` (preview includes `progress_message_id` when present; wake body may also carry it)
+2. If empty → stay silent
+3. While working: `tg_progress(chat_id, progress_message_id, "…status…")` (or `tg_edit_message`)
+4. When done: `tg_delete_message(chat_id, progress_message_id)` → then `tg_send_message` with the final answer
+5. `tg_ack_spool` for each handled `update_id`
+
+Suggested prompt sketch:
+
+> On wake: call `tg_list_spool`. If `count` is 0, do nothing. Otherwise, for each pending item, use `progress_message_id` from the preview (or wake payload) to update status with `tg_progress` / `tg_edit_message` while you work. When finished: **delete** the progress draft with `tg_delete_message`, then send the final answer as a **new** `tg_send_message`. Ack with `tg_ack_spool`. Never print tokens or secrets. Typing alone is not progress — edit the draft.
 
 ## Prerequisites
 
@@ -55,7 +82,7 @@ Then edit:
 |------|---------|
 | `token` | BotFather token (or set `TELEGRAM_BOT_TOKEN`) |
 | `webhook-secret` | Random `secret_token` for `setWebhook` / `X-Telegram-Bot-Api-Secret-Token` |
-| `ALLOWED_CHAT_ID` | Your numeric chat id (receipt, typing, and wake respect this) |
+| `ALLOWED_CHAT_ID` | Your numeric chat id (progress draft, typing, and wake respect this) |
 | `grokbot-wake-url` | Full HTTPS URL of the Grok Bot **webhook routine** |
 | `grokbot-wake-secret` | Sender key / secret for that routine (Authorization Bearer + `X-Webhook-Secret`) |
 
@@ -159,10 +186,13 @@ The MCP process reads `token` / `webhook-secret` / `spool/` relative to the scri
 | Tool | Purpose |
 |------|---------|
 | `tg_get_me` | Bot identity |
-| `tg_send_message` | `chat_id`, `text` |
-| `tg_send_chat_action` | `chat_id`, `action` (default `typing`) |
-| `tg_list_spool` | Pending inbound updates |
-| `tg_ack_spool` | Archive `update_id` → `spool/done/` |
+| `tg_send_message` | `chat_id`, `text` — final answers |
+| `tg_edit_message` | `chat_id`, `message_id`, `text` — edit progress draft |
+| `tg_delete_message` | `chat_id`, `message_id` — clear progress draft before final reply |
+| `tg_progress` | Alias of `tg_edit_message` for status updates |
+| `tg_send_chat_action` | `chat_id`, `action` (default `typing`) — optional keepalive |
+| `tg_list_spool` | Pending inbound updates (preview includes `progress_message_id` when present) |
+| `tg_ack_spool` | Archive `update_id` → `spool/done/` (also moves `.meta.json`) |
 | `tg_webhook_info` | Telegram `getWebhookInfo` |
 | `tg_get_updates` | Pre-webhook long-poll only |
 | `tg_set_webhook` | Set webhook; reads `webhook-secret` |
@@ -176,29 +206,21 @@ Cron/polling drain was the wrong design. Wire immediacy like this:
 3. Copy the routine’s **sender key / secret** into `grokbot-wake-secret` (mode `0600`).
 4. Restart the listener (or supervisor) so it can read the new files.
 
-On each **new** spool write (`created === true`), after Telegram already got `200 ok`, the listener asynchronously POSTs:
+On each **new** spool write (`created === true`), after Telegram already got `200 ok`, the listener sends the progress draft (when allowlisted), then asynchronously POSTs:
 
 ```json
-{ "source": "telegram-bridge", "update_id": "...", "chat_id": 123 }
+{
+  "source": "telegram-bridge",
+  "update_id": "...",
+  "chat_id": 123,
+  "progress_message_id": 456
+}
 ```
 
-Auth headers (default): both `Authorization: Bearer <secret>` and `X-Webhook-Secret: <secret>`.  
+`progress_message_id` is included when the draft send succeeded. Auth headers (default): both `Authorization: Bearer <secret>` and `X-Webhook-Secret: <secret>`.  
 Optional override: set env `GROKBOT_WAKE_HEADER` to `Name: value` to send that single header instead.
 
-If either wake file is missing/empty: spool + Queued receipt + typing still run; wake is skipped with log line `wake skipped: missing grokbot-wake-url/secret`. Wake failures never fail the Telegram webhook response. Only allowlisted chats (`ALLOWED_CHAT_ID`) trigger a wake (same gate as the receipt).
-
-### What the webhook routine should do
-
-When woken, the routine should:
-
-1. Call `tg_list_spool`
-2. If empty → stay silent
-3. If pending → read each update, reply via `tg_send_message` to the allowlisted chat
-4. Call `tg_ack_spool` for each handled `update_id`
-
-Suggested prompt sketch:
-
-> On wake: call `tg_list_spool`. If `count` is 0, do nothing and produce no user-facing message. Otherwise, for each pending item, reply helpfully via `tg_send_message` to that chat_id (only if it matches the allowlisted chat), then `tg_ack_spool` for that `update_id`. Never print tokens or secrets. Do not wait for a cron tick — you were woken because a message arrived.
+If either wake file is missing/empty: spool + progress draft + typing still run; wake is skipped with log line `wake skipped: missing grokbot-wake-url/secret`. Wake failures never fail the Telegram webhook response. Only allowlisted chats (`ALLOWED_CHAT_ID`) trigger a wake (same gate as the progress draft).
 
 Optional smoke test (does not print secrets):
 
@@ -209,7 +231,7 @@ node scripts/send-wake-test.mjs
 ## Security
 
 - **Never commit** `token`, `webhook-secret`, `grokbot-wake-url`, `grokbot-wake-secret`, `ALLOWED_CHAT_ID`, `allowed-chat-id`, `.env`, `spool/`, or logs
-- File mode **0600** for secrets; spool dirs preferably `0700`
+- File mode **0600** for secrets and `.meta.json`; spool dirs preferably `0700`
 - **Allowlist** your chat id; do not run an open relay for the world
 - Rotate the BotFather token if it was pasted into chat, committed, or leaked
 - Listener binds **127.0.0.1 only**; expose it only through a deliberate HTTPS relay
@@ -224,9 +246,9 @@ node scripts/send-wake-test.mjs
 - [ ] `npm run supervise` (or `npm run listener`) — `GET /healthz` returns **200**
 - [ ] HTTPS relay (prefer smee.io) forwards to `http://127.0.0.1:8787/telegram-webhook`
 - [ ] `tg_set_webhook` / `setWebhook` with `secret_token`; `tg_webhook_info` shows the URL
-- [ ] Send yourself a Telegram message → file appears under `spool/` + Queued receipt + wake POST
+- [ ] Send yourself a Telegram message → file under `spool/` + progress draft (`● waking Grok Bot`) + `.meta.json` + wake POST
 - [ ] MCP registered in Grok Bot (`node` + absolute `mcp-server.mjs`)
-- [ ] Webhook routine drains spool, replies with `tg_send_message`, acks with `tg_ack_spool`
+- [ ] Webhook routine: edit progress → delete draft → `tg_send_message` final → `tg_ack_spool`
 - [ ] Empty spool runs stay silent
 - [ ] Confirm `.gitignore` excludes secrets; no secrets under version control
 
@@ -234,8 +256,8 @@ node scripts/send-wake-test.mjs
 
 ```
 grokbot-telegram-bridge/
-  listener.mjs          # HTTP webhook + spool writer + wake POST
-  mcp-server.mjs        # stdio MCP tools
+  listener.mjs          # HTTP webhook + spool + progress draft + wake POST
+  mcp-server.mjs        # stdio MCP tools (incl. edit/delete/progress)
   supervisor.sh         # simple process keeper
   package.json
   scripts/setup-secrets.sh
@@ -245,7 +267,7 @@ grokbot-telegram-bridge/
   README.md
 ```
 
-Runtime data (gitignored): `token`, `webhook-secret`, `grokbot-wake-url`, `grokbot-wake-secret`, `ALLOWED_CHAT_ID`, `spool/`, `listener.pid`, `*.log`.
+Runtime data (gitignored): `token`, `webhook-secret`, `grokbot-wake-url`, `grokbot-wake-secret`, `ALLOWED_CHAT_ID`, `spool/` (incl. `*.meta.json`), `listener.pid`, `*.log`.
 
 ## License
 

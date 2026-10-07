@@ -89,9 +89,24 @@ async function telegramGet(method, query = {}) {
   return data;
 }
 
+/** Read spool/<update_id>.meta.json for progress_message_id (if present). */
+async function readProgressMeta(updateId) {
+  const metaPath = path.join(SPOOL, `${updateId}.meta.json`);
+  try {
+    const raw = await fsp.readFile(metaPath, "utf8");
+    const meta = JSON.parse(raw);
+    if (meta && meta.progress_message_id != null) {
+      return meta.progress_message_id;
+    }
+  } catch {
+    // missing or unreadable meta is fine
+  }
+  return null;
+}
+
 const server = new McpServer({
   name: "grokbot-telegram-bridge",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 server.registerTool(
@@ -133,6 +148,93 @@ server.registerTool(
 );
 
 server.registerTool(
+  "tg_edit_message",
+  {
+    title: "Telegram editMessageText",
+    description:
+      "Edit an existing Telegram message (OpenClaw-style progress draft updates). Never logs the bot token.",
+    inputSchema: {
+      chat_id: z.union([z.string(), z.number()]).describe("Telegram chat id"),
+      message_id: z.union([z.string(), z.number()]).describe("Message id to edit"),
+      text: z.string().min(1).describe("New message text"),
+    },
+  },
+  async ({ chat_id, message_id, text }) => {
+    try {
+      const data = await telegramApi("editMessageText", {
+        chat_id,
+        message_id: Number(message_id),
+        text,
+      });
+      if (!data.ok) return textResult(data, true);
+      return textResult({
+        ok: true,
+        message_id: data.result?.message_id ?? Number(message_id),
+        chat_id: data.result?.chat?.id ?? chat_id,
+      });
+    } catch (err) {
+      return textResult({ error: err?.message || "editMessageText failed" }, true);
+    }
+  }
+);
+
+server.registerTool(
+  "tg_delete_message",
+  {
+    title: "Telegram deleteMessage",
+    description:
+      "Delete a Telegram message (e.g. clear the progress draft before sending the final answer). Never logs the bot token.",
+    inputSchema: {
+      chat_id: z.union([z.string(), z.number()]).describe("Telegram chat id"),
+      message_id: z.union([z.string(), z.number()]).describe("Message id to delete"),
+    },
+  },
+  async ({ chat_id, message_id }) => {
+    try {
+      const data = await telegramApi("deleteMessage", {
+        chat_id,
+        message_id: Number(message_id),
+      });
+      if (!data.ok) return textResult(data, true);
+      return textResult({ ok: true, chat_id, message_id: Number(message_id) });
+    } catch (err) {
+      return textResult({ error: err?.message || "deleteMessage failed" }, true);
+    }
+  }
+);
+
+server.registerTool(
+  "tg_progress",
+  {
+    title: "Update progress draft",
+    description:
+      "Alias of tg_edit_message — edit the OpenClaw-style progress draft with a status/commentary line. Never logs the bot token.",
+    inputSchema: {
+      chat_id: z.union([z.string(), z.number()]).describe("Telegram chat id"),
+      message_id: z.union([z.string(), z.number()]).describe("Progress draft message id"),
+      text: z.string().min(1).describe("Progress / status text"),
+    },
+  },
+  async ({ chat_id, message_id, text }) => {
+    try {
+      const data = await telegramApi("editMessageText", {
+        chat_id,
+        message_id: Number(message_id),
+        text,
+      });
+      if (!data.ok) return textResult(data, true);
+      return textResult({
+        ok: true,
+        message_id: data.result?.message_id ?? Number(message_id),
+        chat_id: data.result?.chat?.id ?? chat_id,
+      });
+    } catch (err) {
+      return textResult({ error: err?.message || "tg_progress failed" }, true);
+    }
+  }
+);
+
+server.registerTool(
   "tg_send_chat_action",
   {
     title: "Telegram sendChatAction",
@@ -163,7 +265,8 @@ server.registerTool(
   "tg_list_spool",
   {
     title: "List spool",
-    description: "List pending inbound Telegram updates in the local spool directory.",
+    description:
+      "List pending inbound Telegram updates in the local spool directory. Preview includes progress_message_id from .meta.json when present.",
   },
   async () => {
     try {
@@ -171,15 +274,20 @@ server.registerTool(
       const names = await fsp.readdir(SPOOL);
       const pending = [];
       for (const name of names) {
-        if (!name.endsWith(".json") || name.startsWith(".")) continue;
+        // Skip meta sidecars and temp files; only list update JSON.
+        if (!name.endsWith(".json") || name.startsWith(".") || name.endsWith(".meta.json")) {
+          continue;
+        }
         const full = path.join(SPOOL, name);
         const st = await fsp.stat(full).catch(() => null);
         if (!st || !st.isFile()) continue;
+        const updateId = String(name.replace(/\.json$/, ""));
         let preview = null;
         try {
           const raw = await fsp.readFile(full, "utf8");
           const update = JSON.parse(raw);
           const msg = update.message || update.edited_message;
+          const progressMessageId = await readProgressMeta(updateId);
           preview = {
             update_id: update.update_id,
             chat_id: msg?.chat?.id ?? null,
@@ -187,12 +295,15 @@ server.registerTool(
             text: typeof msg?.text === "string" ? msg.text.slice(0, 200) : null,
             date: msg?.date ?? null,
           };
+          if (progressMessageId != null) {
+            preview.progress_message_id = progressMessageId;
+          }
         } catch {
           preview = { file: name, parse_error: true };
         }
         pending.push({
           file: name,
-          update_id: String(name.replace(/\.json$/, "")),
+          update_id: updateId,
           bytes: st.size,
           mtime_ms: st.mtimeMs,
           preview,
@@ -210,7 +321,8 @@ server.registerTool(
   "tg_ack_spool",
   {
     title: "Ack spool item",
-    description: "Acknowledge (archive) a spooled update by moving it to spool/done/.",
+    description:
+      "Acknowledge (archive) a spooled update by moving it to spool/done/. Also moves .meta.json sidecar if present.",
     inputSchema: {
       update_id: z.union([z.string(), z.number()]).describe("Telegram update_id to acknowledge"),
     },
@@ -232,6 +344,20 @@ server.registerTool(
         // Cross-device or dest exists — copy then unlink.
         await fsp.copyFile(src, dest);
         await fsp.unlink(src);
+      }
+      // Archive progress meta sidecar alongside the update (best-effort).
+      const metaSrc = path.join(SPOOL, `${id}.meta.json`);
+      const metaDest = path.join(DONE, `${id}.meta.json`);
+      try {
+        await fsp.access(metaSrc, fs.constants.F_OK);
+        try {
+          await fsp.rename(metaSrc, metaDest);
+        } catch {
+          await fsp.copyFile(metaSrc, metaDest);
+          await fsp.unlink(metaSrc);
+        }
+      } catch {
+        // no meta — fine
       }
       return textResult({ ok: true, update_id: id, archived: dest });
     } catch (err) {
