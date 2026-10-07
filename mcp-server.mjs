@@ -208,7 +208,7 @@ server.registerTool(
   {
     title: "Update progress draft",
     description:
-      "Alias of tg_edit_message — edit the OpenClaw-style progress draft with a status/commentary line. Never logs the bot token.",
+      "Alias of tg_edit_message — edit the OpenClaw-style progress draft with the SAME wording as Grok in-app commentary at each beat (e.g. \"Running a few commands\"). Delete before final tg_send_message. Never logs the bot token.",
     inputSchema: {
       chat_id: z.union([z.string(), z.number()]).describe("Telegram chat id"),
       message_id: z.union([z.string(), z.number()]).describe("Progress draft message id"),

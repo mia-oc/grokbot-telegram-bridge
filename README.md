@@ -24,16 +24,25 @@ Architecture in one line: **Telegram → HTTPS relay → local listener → spoo
 
 ## Progress drafts (OpenClaw `streaming.mode=progress`)
 
-OpenClaw’s Telegram channel can show a live **progress** message that is edited as the agent works, then cleared when the final answer lands. This bridge mirrors that UX:
+OpenClaw’s Telegram channel can show a live **progress** message that is edited as the agent works, then cleared when the final answer lands. This bridge mirrors that UX.
+
+### Telegram twin of Grok in-app commentary
+
+The progress draft is the **Telegram twin** of Grok Bot’s in-app working commentary (the short status lines you see in the app while tools run — e.g. `Running a few commands`).
+
+- At each beat, the agent must call `tg_progress` (or `tg_edit_message`) with the **same wording** as that in-app commentary — not a paraphrase, not a custom “status protocol”.
+- Example: when the app shows `Running a few commands`, Telegram should show `Running a few commands` (optionally with a leading `● ` if you keep the draft’s bullet style consistent).
+- Before the final answer: **delete** the draft (`tg_delete_message`), then `tg_send_message` with the real reply.
+- The listener’s first line stays `● waking Grok Bot` until the agent’s first edit; **subsequent edits** should be exact commentary mirrors.
 
 | Phase | What happens |
 |-------|----------------|
-| **Inbound** | Listener sends **one** status draft (e.g. `● waking Grok Bot`). Persists `{ chat_id, progress_message_id }` to `spool/<update_id>.meta.json` (mode `0600`). Idempotent redelivery does **not** send another draft. |
-| **Working** | Agent **edits that same message** via `tg_edit_message` / `tg_progress` with commentary / tool-ish status lines (rolling log under a headline). |
+| **Inbound** | Listener sends **one** status draft (`● waking Grok Bot`). Persists `{ chat_id, progress_message_id }` to `spool/<update_id>.meta.json` (mode `0600`). Idempotent redelivery does **not** send another draft. |
+| **Working** | Agent **edits that same message** via `tg_progress` / `tg_edit_message` with the **exact** in-app Grok commentary at each beat (e.g. `Running a few commands`). |
 | **Done** | Agent **deletes** the progress draft (`tg_delete_message`), then sends the **final answer as a new normal message** (`tg_send_message`). |
 | **Typing** | Optional/secondary keepalive only — **progress text is the signal of life**, not “typing…”. |
 
-A static “Queued…” receipt is **not** the design. Progress text that updates is.
+A static “Queued…” receipt is **not** the design. Progress text that updates — mirroring in-app commentary — is.
 
 ### Agent routine behaviour (recommended)
 
@@ -41,13 +50,13 @@ When woken, the webhook routine should:
 
 1. Call `tg_list_spool` (preview includes `progress_message_id` when present; wake body may also carry it)
 2. If empty → stay silent
-3. While working: `tg_progress(chat_id, progress_message_id, "…status…")` (or `tg_edit_message`)
+3. While working: at each commentary beat, `tg_progress(chat_id, progress_message_id, "<exact in-app wording>")` (e.g. `Running a few commands`)
 4. When done: `tg_delete_message(chat_id, progress_message_id)` → then `tg_send_message` with the final answer
 5. `tg_ack_spool` for each handled `update_id`
 
 Suggested prompt sketch:
 
-> On wake: call `tg_list_spool`. If `count` is 0, do nothing. Otherwise, for each pending item, use `progress_message_id` from the preview (or wake payload) to update status with `tg_progress` / `tg_edit_message` while you work. When finished: **delete** the progress draft with `tg_delete_message`, then send the final answer as a **new** `tg_send_message`. Ack with `tg_ack_spool`. Never print tokens or secrets. Typing alone is not progress — edit the draft.
+> On wake: call `tg_list_spool`. If `count` is 0, do nothing. Otherwise, for each pending item, use `progress_message_id` from the preview (or wake payload). The progress draft is the Telegram twin of Grok in-app commentary: whenever the app would show a working line (e.g. `Running a few commands`), call `tg_progress` / `tg_edit_message` with that **same wording**. When finished: **delete** the progress draft with `tg_delete_message`, then send the final answer as a **new** `tg_send_message`. Ack with `tg_ack_spool`. Never print tokens or secrets. Typing alone is not progress — mirror commentary into the draft.
 
 ## Prerequisites
 

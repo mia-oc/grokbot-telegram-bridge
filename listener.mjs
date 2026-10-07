@@ -27,7 +27,11 @@ const TYPING_INTERVAL_MS = 4_000;
 const TYPING_MAX_MS = 120_000;
 const WAKE_TIMEOUT_MS = 10_000;
 
-/** OpenClaw-style progress draft initial headline (streaming.mode=progress). */
+/**
+ * OpenClaw-style progress draft initial headline (streaming.mode=progress).
+ * Keep the wake line for inbound; agent edits should then mirror exact
+ * Grok in-app commentary (e.g. "Running a few commands") via tg_progress.
+ */
 const PROGRESS_DRAFT_INITIAL = "● waking Grok Bot";
 
 function readTrimmedFileSync(p) {
