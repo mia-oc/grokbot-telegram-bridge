@@ -31,7 +31,7 @@ Architecture in one line: **Telegram → HTTPS relay → local listener → spoo
 ## Install
 
 ```bash
-git clone https://github.com/mia-oc/grokbot-telegram-bridge.git
+git clone <this-repo-url> grokbot-telegram-bridge
 cd grokbot-telegram-bridge
 npm install
 ```
