@@ -109,6 +109,33 @@ async function sendChatAction(token, chatId, action = "typing") {
   }
 }
 
+async function sendTextMessage(token, chatId, text) {
+  if (!token || chatId == null || !text) return;
+  try {
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+  } catch {
+    // best-effort; never log token
+  }
+}
+
+/** Immediate human-visible receipt so "typing" is not the only signal. */
+async function sendQueuedReceipt(chatId, created) {
+  if (!created) return;
+  const token = loadBotToken();
+  const allowed = loadAllowedChatId();
+  if (allowed !== null && String(chatId) !== allowed) return;
+  await sendTextMessage(
+    token,
+    chatId,
+    "Queued for Grok Bot. The drain runs about every 5 minutes (sooner if the agent is already awake). Typing alone is not progress — this receipt is.",
+  );
+}
+
 /**
  * While spool file exists (and under 2 min), send typing every 4s.
  * Only for message updates; respects ALLOWED_CHAT_ID when present.
@@ -217,11 +244,12 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const { path: spoolPath } = await writeSpoolAtomic(String(updateId), bodyBuf);
+      const { path: spoolPath, created } = await writeSpoolAtomic(String(updateId), bodyBuf);
       send(res, 200, "ok");
 
       const msg = update.message || update.edited_message;
       if (msg && msg.chat && msg.chat.id != null) {
+        void sendQueuedReceipt(msg.chat.id, created);
         startTypingKeepalive(spoolPath, msg.chat.id);
       }
       return;

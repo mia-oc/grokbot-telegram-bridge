@@ -20,6 +20,8 @@ Open-source **Telegram ↔ Grok Bot** bridge: a local webhook listener, on-disk 
 
 Architecture in one line: **Telegram → HTTPS relay → local listener → spool → Grok Bot MCP routine → `tg_send_message`**.
 
+**UX note:** Telegram “typing…” alone is *not* progress (OpenClaw can stream tool actions; this bridge cannot). The listener therefore sends an immediate **“Queued for Grok Bot…”** receipt when a new update is spooled, then keeps typing warm until the spool item is acknowledged.
+
 ## Prerequisites
 
 - **Node.js 18+** (20+ recommended)
