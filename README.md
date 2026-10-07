@@ -20,7 +20,7 @@ Open-source **Telegram ↔ Grok Bot** bridge: a local webhook listener, on-disk 
 - A replacement for BotFather, Telegram clients, or Grok Bot itself
 - Full OpenClaw tool-stream UI (this bridge approximates `streaming.mode=progress` with edit/delete, not native Telegram streaming)
 
-Architecture in one line: **Telegram → HTTPS relay → local listener → spool + progress draft → wake POST → Grok Bot webhook routine → MCP (`tg_progress` / `tg_delete_message` / `tg_send_message`)**.
+Architecture in one line: **Telegram → HTTPS relay → local listener → spool + progress draft + keepalive ticker → wake POST → Grok Bot webhook routine → MCP (`tg_progress` hold / `tg_delete_message` / `tg_send_message`)**.
 
 ## Progress drafts (OpenClaw `streaming.mode=progress`)
 
@@ -33,14 +33,18 @@ The progress draft is the **Telegram twin** of Grok Bot’s in-app working comme
 - At each beat, the agent must call `tg_progress` (or `tg_edit_message`) with the **same wording** as that in-app commentary — not a paraphrase, not a custom “status protocol”.
 - Example: when the app shows `Running a few commands`, Telegram should show `Running a few commands` (optionally with a leading `● ` if you keep the draft’s bullet style consistent).
 - Before the final answer: **delete** the draft (`tg_delete_message`), then `tg_send_message` with the real reply.
-- The listener’s first line stays `● waking Grok Bot` until the agent’s first edit; **subsequent edits** should be exact commentary mirrors.
+- The listener’s first line is `● waking Grok Bot`, then the **listener keepalive** cycles Grok-style lines until the agent’s first `tg_progress` / `tg_edit_message` sets `hold: true` (or the draft is deleted / spool acked / ~90s). After hold, **agent edits** should be exact commentary mirrors.
 
 | Phase | What happens |
 |-------|----------------|
-| **Inbound** | Listener sends **one** status draft (`● waking Grok Bot`). Persists `{ chat_id, progress_message_id }` to `spool/<update_id>.meta.json` (mode `0600`). Idempotent redelivery does **not** send another draft. |
-| **Working** | Agent **edits that same message** via `tg_progress` / `tg_edit_message` with the **exact** in-app Grok commentary at each beat (e.g. `Running a few commands`). |
-| **Done** | Agent **deletes** the progress draft (`tg_delete_message`), then sends the **final answer as a new normal message** (`tg_send_message`). |
+| **Inbound** | Listener sends **one** status draft (`● waking Grok Bot`). Persists `{ chat_id, progress_message_id }` to `spool/<update_id>.meta.json` (mode `0600`). Idempotent redelivery does **not** send another draft or start another ticker. |
+| **Listener keepalive** | After a successful draft, the listener starts a **non-blocking** ticker (~every 2.5s, up to ~90s) that `editMessageText`s the draft through Grok-style lines (e.g. `● Running a few commands` → `● Reading files` → `● Searching the web` → `● Writing a reply`). This keeps the user seeing motion even when the wake agent is slow or skips `tg_progress`. |
+| **Agent hold** | When `tg_progress` / `tg_edit_message` succeeds for a chat whose spool `*.meta.json` matches that `progress_message_id`, the MCP server sets `hold: true` on that meta (best-effort). The listener ticker stops overwriting agent commentary. |
+| **Working** | Agent **edits that same message** via `tg_progress` / `tg_edit_message` with the **exact** in-app Grok commentary at each beat (e.g. `Running a few commands`). First successful edit holds the ticker. |
+| **Done** | Agent **deletes** the progress draft (`tg_delete_message`), then sends the **final answer as a new normal message** (`tg_send_message`). Delete also stops the ticker (Telegram message-not-found). |
 | **Typing** | Optional/secondary keepalive only — **progress text is the signal of life**, not “typing…”. |
+
+**Keepalive stop conditions:** spool file for that `update_id` is gone (acked); Telegram returns message-not-found (agent deleted draft); `meta.json` has `hold: true` (agent took over); ~90s timeout. The ticker never blocks the webhook `200` or the wake POST. Never logs the bot token.
 
 A static “Queued…” receipt is **not** the design. Progress text that updates — mirroring in-app commentary — is.
 
@@ -255,7 +259,7 @@ node scripts/send-wake-test.mjs
 - [ ] `npm run supervise` (or `npm run listener`) — `GET /healthz` returns **200**
 - [ ] HTTPS relay (prefer smee.io) forwards to `http://127.0.0.1:8787/telegram-webhook`
 - [ ] `tg_set_webhook` / `setWebhook` with `secret_token`; `tg_webhook_info` shows the URL
-- [ ] Send yourself a Telegram message → file under `spool/` + progress draft (`● waking Grok Bot`) + `.meta.json` + wake POST
+- [ ] Send yourself a Telegram message → file under `spool/` + progress draft (`● waking Grok Bot`) cycling keepalive lines + `.meta.json` + wake POST; agent `tg_progress` sets `hold: true`
 - [ ] MCP registered in Grok Bot (`node` + absolute `mcp-server.mjs`)
 - [ ] Webhook routine: edit progress → delete draft → `tg_send_message` final → `tg_ack_spool`
 - [ ] Empty spool runs stay silent
@@ -265,7 +269,7 @@ node scripts/send-wake-test.mjs
 
 ```
 grokbot-telegram-bridge/
-  listener.mjs          # HTTP webhook + spool + progress draft + wake POST
+  listener.mjs          # HTTP webhook + spool + progress draft + keepalive + wake POST
   mcp-server.mjs        # stdio MCP tools (incl. edit/delete/progress)
   supervisor.sh         # simple process keeper
   package.json

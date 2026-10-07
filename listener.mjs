@@ -26,13 +26,27 @@ const BODY_LIMIT = 1_048_576; // ~1 MiB
 const TYPING_INTERVAL_MS = 4_000;
 const TYPING_MAX_MS = 120_000;
 const WAKE_TIMEOUT_MS = 10_000;
+const PROGRESS_KEEPALIVE_INTERVAL_MS = 2_500;
+const PROGRESS_KEEPALIVE_MAX_MS = 90_000;
 
 /**
  * OpenClaw-style progress draft initial headline (streaming.mode=progress).
  * Keep the wake line for inbound; agent edits should then mirror exact
  * Grok in-app commentary (e.g. "Running a few commands") via tg_progress.
+ * Listener keepalive cycles the lines below until agent holds/deletes or timeout.
  */
 const PROGRESS_DRAFT_INITIAL = "● waking Grok Bot";
+
+/** Exact Grok-style commentary lines for listener progress keepalive ticker. */
+const PROGRESS_KEEPALIVE_LINES = [
+  "● Running a few commands",
+  "● Reading files",
+  "● Searching the web",
+  "● Writing a reply",
+];
+
+/** Active progress keepalive timers keyed by update_id (idempotent guard). */
+const progressKeepalives = new Map();
 
 function readTrimmedFileSync(p) {
   try {
@@ -147,6 +161,125 @@ async function sendTextMessage(token, chatId, text) {
     // best-effort; never log token
     return null;
   }
+}
+
+/**
+ * editMessageText; returns { ok, notFound }.
+ * notFound when Telegram says the message is gone (agent deleted draft).
+ * Never logs token.
+ */
+async function editMessageText(token, chatId, messageId, text) {
+  if (!token || chatId == null || messageId == null || !text) {
+    return { ok: false, notFound: false };
+  }
+  try {
+    const url = `https://api.telegram.org/bot${token}/editMessageText`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: Number(messageId),
+        text,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (data && data.ok) return { ok: true, notFound: false };
+    // Agent deleted the draft (or message otherwise gone).
+    const desc = data && typeof data.description === "string" ? data.description.toLowerCase() : "";
+    const gone =
+      !!data &&
+      (data.error_code === 400 || data.error_code === 404) &&
+      (desc.includes("message to edit not found") ||
+        desc.includes("message can't be edited") ||
+        desc.includes("message not found"));
+    return { ok: false, notFound: gone };
+  } catch {
+    // best-effort; never log token
+    return { ok: false, notFound: false };
+  }
+}
+
+/**
+ * Read spool/<update_id>.meta.json; return parsed object or null.
+ */
+async function readProgressMetaFile(updateId) {
+  const metaPath = path.join(SPOOL, `${updateId}.meta.json`);
+  try {
+    const raw = await fsp.readFile(metaPath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Listener progress keepalive: cycle Grok-style draft lines every ~2.5s so the
+ * user sees motion even if the wake agent is slow or skips tg_progress.
+ * Stops when: spool file acked/gone; Telegram message-not-found; meta.hold;
+ * ~90s timeout. Non-blocking (interval + unref). Idempotent per update_id.
+ */
+function startProgressKeepalive(updateId, chatId, progressMessageId) {
+  const id = String(updateId);
+  if (progressKeepalives.has(id)) return;
+  if (chatId == null || progressMessageId == null) return;
+  if (!chatAllowed(chatId)) return;
+
+  const token = loadBotToken();
+  if (!token) return;
+
+  const spoolPath = path.join(SPOOL, `${id}.json`);
+  const started = Date.now();
+  let stopped = false;
+  let lineIndex = 0;
+
+  const stop = (reason) => {
+    if (stopped) return;
+    stopped = true;
+    const entry = progressKeepalives.get(id);
+    if (entry && entry.timer) clearInterval(entry.timer);
+    progressKeepalives.delete(id);
+    if (reason) {
+      console.error(`listener: progress keepalive stop update_id=${id} reason=${reason}`);
+    }
+  };
+
+  const tick = async () => {
+    if (stopped) return;
+    if (Date.now() - started >= PROGRESS_KEEPALIVE_MAX_MS) {
+      stop("timeout");
+      return;
+    }
+    try {
+      await fsp.access(spoolPath, fs.constants.F_OK);
+    } catch {
+      stop("spool_acked");
+      return;
+    }
+    const meta = await readProgressMetaFile(id);
+    if (meta && meta.hold === true) {
+      stop("hold");
+      return;
+    }
+    const line = PROGRESS_KEEPALIVE_LINES[lineIndex % PROGRESS_KEEPALIVE_LINES.length];
+    lineIndex += 1;
+    const result = await editMessageText(token, chatId, progressMessageId, line);
+    if (result.notFound) {
+      stop("message_gone");
+      return;
+    }
+  };
+
+  // First edit after a short delay so the initial "waking" line is visible briefly.
+  const timer = setInterval(() => {
+    void tick().then(() => {
+      if (stopped) clearInterval(timer);
+    });
+  }, PROGRESS_KEEPALIVE_INTERVAL_MS);
+  timer.unref?.();
+  progressKeepalives.set(id, { timer, chatId, progressMessageId });
+  // Kick first cycle soon (non-blocking) without delaying webhook/wake.
+  void tick();
 }
 
 /**
@@ -365,6 +498,10 @@ const server = http.createServer(async (req, res) => {
       if (chatId != null) {
         // Await draft so wake POST can include progress_message_id.
         progressMessageId = await startProgressDraft(chatId, String(updateId), created);
+        // Keepalive ticker only for a newly created draft (idempotent redelivery skips).
+        if (progressMessageId != null) {
+          startProgressKeepalive(String(updateId), chatId, progressMessageId);
+        }
         startTypingKeepalive(spoolPath, chatId);
       }
       if (created) {

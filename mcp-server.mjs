@@ -104,9 +104,46 @@ async function readProgressMeta(updateId) {
   return null;
 }
 
+/**
+ * When the agent successfully edits a progress draft, set hold: true on the
+ * matching spool *.meta.json so the listener keepalive ticker stops overwriting
+ * agent commentary. Best-effort; never fails the MCP tool if meta is missing.
+ */
+async function holdProgressMeta(chatId, messageId) {
+  try {
+    const names = await fsp.readdir(SPOOL);
+    const wantChat = String(chatId);
+    const wantMsg = Number(messageId);
+    for (const name of names) {
+      if (!name.endsWith(".meta.json") || name.startsWith(".")) continue;
+      const metaPath = path.join(SPOOL, name);
+      let meta;
+      try {
+        meta = JSON.parse(await fsp.readFile(metaPath, "utf8"));
+      } catch {
+        continue;
+      }
+      if (!meta || meta.progress_message_id == null) continue;
+      if (Number(meta.progress_message_id) !== wantMsg) continue;
+      if (meta.chat_id != null && String(meta.chat_id) !== wantChat) continue;
+      if (meta.hold === true) return;
+      const next = { ...meta, hold: true };
+      const tmp = path.join(
+        SPOOL,
+        `.${name}.${process.pid}.${Date.now()}.tmp`,
+      );
+      await fsp.writeFile(tmp, JSON.stringify(next) + "\n", { mode: 0o600 });
+      await fsp.rename(tmp, metaPath);
+      return;
+    }
+  } catch {
+    // best-effort
+  }
+}
+
 const server = new McpServer({
   name: "grokbot-telegram-bridge",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 server.registerTool(
@@ -167,6 +204,7 @@ server.registerTool(
         text,
       });
       if (!data.ok) return textResult(data, true);
+      await holdProgressMeta(chat_id, message_id);
       return textResult({
         ok: true,
         message_id: data.result?.message_id ?? Number(message_id),
@@ -223,6 +261,7 @@ server.registerTool(
         text,
       });
       if (!data.ok) return textResult(data, true);
+      await holdProgressMeta(chat_id, message_id);
       return textResult({
         ok: true,
         message_id: data.result?.message_id ?? Number(message_id),
