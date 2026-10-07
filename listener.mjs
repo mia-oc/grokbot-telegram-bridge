@@ -2,7 +2,7 @@
 /**
  * Telegram webhook listener — binds 127.0.0.1:8787 only.
  * POST /telegram-webhook  ·  GET /healthz
- * Never logs token, webhook secret, or public URL.
+ * Never logs token, webhook secret, wake secret/url, or public URL.
  */
 import http from "node:http";
 import fs from "node:fs";
@@ -18,11 +18,14 @@ const DONE = path.join(SPOOL, "done");
 const SECRET_PATH = path.join(ROOT, "webhook-secret");
 const TOKEN_PATH = path.join(ROOT, "token");
 const ALLOWED_CHAT_PATH = path.join(ROOT, "ALLOWED_CHAT_ID");
+const WAKE_URL_PATH = path.join(ROOT, "grokbot-wake-url");
+const WAKE_SECRET_PATH = path.join(ROOT, "grokbot-wake-secret");
 const HOST = "127.0.0.1";
 const PORT = 8787;
 const BODY_LIMIT = 1_048_576; // ~1 MiB
 const TYPING_INTERVAL_MS = 4_000;
 const TYPING_MAX_MS = 120_000;
+const WAKE_TIMEOUT_MS = 10_000;
 
 function readTrimmedFileSync(p) {
   try {
@@ -62,6 +65,12 @@ function loadBotToken() {
 function loadAllowedChatId() {
   const raw = readTrimmedFileSync(ALLOWED_CHAT_PATH);
   return raw || null;
+}
+
+function chatAllowed(chatId) {
+  const allowed = loadAllowedChatId();
+  if (allowed === null) return true;
+  return String(chatId) === allowed;
 }
 
 async function ensureDirs() {
@@ -127,13 +136,73 @@ async function sendTextMessage(token, chatId, text) {
 async function sendQueuedReceipt(chatId, created) {
   if (!created) return;
   const token = loadBotToken();
-  const allowed = loadAllowedChatId();
-  if (allowed !== null && String(chatId) !== allowed) return;
+  if (!chatAllowed(chatId)) return;
   await sendTextMessage(
     token,
     chatId,
-    "Queued for Grok Bot. The drain runs about every 5 minutes (sooner if the agent is already awake). Typing alone is not progress — this receipt is.",
+    "Queued for Grok Bot — waking the agent now. Typing alone is not progress; this receipt is.",
   );
+}
+
+/**
+ * POST a wake to Grok Bot webhook-routine after a NEW spool write.
+ * Never logs URL or secret. Failures are log-only; never affect Telegram 200.
+ */
+async function wakeGrokBot({ updateId, chatId }) {
+  if (!chatAllowed(chatId)) return;
+
+  const wakeUrl = readTrimmedFileSync(WAKE_URL_PATH);
+  const wakeSecret = readTrimmedFileSync(WAKE_SECRET_PATH);
+  if (!wakeUrl || !wakeSecret) {
+    console.error("listener: wake skipped: missing grokbot-wake-url/secret");
+    return;
+  }
+
+  const headers = { "Content-Type": "application/json" };
+  const customHeader = (process.env.GROKBOT_WAKE_HEADER || "").trim();
+  if (customHeader) {
+    const colon = customHeader.indexOf(":");
+    if (colon > 0) {
+      const name = customHeader.slice(0, colon).trim();
+      const value = customHeader.slice(colon + 1).trim();
+      if (name && value) headers[name] = value;
+    }
+  } else {
+    headers["Authorization"] = `Bearer ${wakeSecret}`;
+    headers["X-Webhook-Secret"] = wakeSecret;
+  }
+
+  const body = JSON.stringify({
+    source: "telegram-bridge",
+    update_id: String(updateId),
+    chat_id: chatId,
+  });
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), WAKE_TIMEOUT_MS);
+  try {
+    const res = await fetch(wakeUrl, {
+      method: "POST",
+      headers,
+      body,
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      console.error(`listener: wake POST failed status=${res.status}`);
+    } else {
+      console.error(`listener: wake POST ok status=${res.status}`);
+    }
+  } catch (err) {
+    const msg =
+      err && err.name === "AbortError"
+        ? "timeout"
+        : err && err.message
+          ? err.message
+          : "unknown";
+    console.error(`listener: wake POST error: ${msg}`);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -143,9 +212,7 @@ async function sendQueuedReceipt(chatId, created) {
 function startTypingKeepalive(spoolPath, chatId) {
   const token = loadBotToken();
   if (!token || chatId == null) return;
-
-  const allowed = loadAllowedChatId();
-  if (allowed !== null && String(chatId) !== allowed) return;
+  if (!chatAllowed(chatId)) return;
 
   const started = Date.now();
   let stopped = false;
@@ -248,9 +315,13 @@ const server = http.createServer(async (req, res) => {
       send(res, 200, "ok");
 
       const msg = update.message || update.edited_message;
-      if (msg && msg.chat && msg.chat.id != null) {
-        void sendQueuedReceipt(msg.chat.id, created);
-        startTypingKeepalive(spoolPath, msg.chat.id);
+      const chatId = msg && msg.chat && msg.chat.id != null ? msg.chat.id : null;
+      if (chatId != null) {
+        void sendQueuedReceipt(chatId, created);
+        startTypingKeepalive(spoolPath, chatId);
+      }
+      if (created) {
+        void wakeGrokBot({ updateId, chatId });
       }
       return;
     }

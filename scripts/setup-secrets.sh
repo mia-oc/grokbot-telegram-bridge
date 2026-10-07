@@ -47,7 +47,18 @@ if [[ ! -f allowed-chat-id ]]; then
   chmod 0600 allowed-chat-id
 fi
 
+for f in grokbot-wake-url grokbot-wake-secret; do
+  if [[ ! -f "$f" ]]; then
+    : > "$f"
+    chmod 0600 "$f"
+    echo "created empty $f (0600) — paste Grok Bot webhook routine URL/secret"
+  else
+    chmod 0600 "$f"
+    echo "$f already present; ensured 0600"
+  fi
+done
+
 mkdir -p spool/done
 chmod 0700 spool spool/done 2>/dev/null || true
 
-echo "done. Fill token and ALLOWED_CHAT_ID, then start the listener."
+echo "done. Fill token, ALLOWED_CHAT_ID, grokbot-wake-url, grokbot-wake-secret, then start the listener."

@@ -4,7 +4,7 @@
   "private": false,
   "license": "MIT",
   "type": "module",
-  "description": "Open-source Telegram ↔ Grok Bot bridge: local webhook listener, spool, and stdio MCP tools",
+  "description": "Open-source Telegram \u2194 Grok Bot bridge: local webhook listener, spool, wake POST, and stdio MCP tools",
   "engines": {
     "node": ">=18"
   },
@@ -12,7 +12,8 @@
     "listener": "node listener.mjs",
     "mcp": "node mcp-server.mjs",
     "supervise": "bash supervisor.sh",
-    "setup-secrets": "bash scripts/setup-secrets.sh"
+    "setup-secrets": "bash scripts/setup-secrets.sh",
+    "wake-test": "node scripts/send-wake-test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

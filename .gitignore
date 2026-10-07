@@ -4,10 +4,14 @@ webhook-secret
 public-url
 ALLOWED_CHAT_ID
 allowed-chat-id
+grokbot-wake-url
+grokbot-wake-secret
 spool/
 .env
 *.log
 .pid
 listener.pid
 listener.log
+smee.pid
+smee.log
 .DS_Store
