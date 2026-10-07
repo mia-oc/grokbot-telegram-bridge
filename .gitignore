@@ -1,0 +1,13 @@
+node_modules/
+token
+webhook-secret
+public-url
+ALLOWED_CHAT_ID
+allowed-chat-id
+spool/
+.env
+*.log
+.pid
+listener.pid
+listener.log
+.DS_Store

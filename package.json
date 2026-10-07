@@ -1,0 +1,41 @@
+{
+  "name": "grokbot-telegram-bridge",
+  "version": "1.0.0",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "description": "Open-source Telegram ↔ Grok Bot bridge: local webhook listener, spool, and stdio MCP tools",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "listener": "node listener.mjs",
+    "mcp": "node mcp-server.mjs",
+    "supervise": "bash supervisor.sh",
+    "setup-secrets": "bash scripts/setup-secrets.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^3.25.0"
+  },
+  "bin": {
+    "grokbot-telegram-mcp": "./mcp-server.mjs",
+    "grokbot-telegram-listener": "./listener.mjs"
+  },
+  "files": [
+    "listener.mjs",
+    "mcp-server.mjs",
+    "supervisor.sh",
+    "scripts/",
+    "LICENSE",
+    "README.md",
+    "example.env.example"
+  ],
+  "keywords": [
+    "telegram",
+    "grok",
+    "mcp",
+    "webhook",
+    "bridge"
+  ]
+}
